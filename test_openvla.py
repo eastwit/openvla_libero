@@ -1,5 +1,6 @@
 import torch
 from transformers import AutoProcessor, AutoModelForVision2Seq
+from huggingface_hub import try_to_load_from_cache
 from PIL import Image
 import os
 
@@ -8,7 +9,15 @@ os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
 model_id = "openvla/openvla-7b"
 
-print(f"正在尝试加载模型，请耐心等待文件下载...")
+filepath = try_to_load_from_cache(model_id, "config.json")
+
+if isinstance(filepath, str):
+    print(f"✅ 模型已存在！本地缓存路径为: {os.path.dirname(filepath)}")
+    print(f"正在尝试加载模型......")
+
+else:
+    print("❌ 本地未找到完整模型，即将开始下载......")
+
 
 try:
     # 1. 加载处理器
