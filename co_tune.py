@@ -1,136 +1,109 @@
+import os
+# 环境与镜像设置
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 import torch
 import numpy as np
 import imageio
-import os
 from transformers import AutoProcessor, AutoModelForVision2Seq
-from huggingface_hub import try_to_load_from_cache
 from PIL import Image
-
-# LIBERO 相关导入
-from libero.libero import benchmark
-from libero.libero.envs import OffScreenRenderEnv
-from libero.libero.utils import get_libero_path
-
-# 屏蔽 Tokenizer 并行警告
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
-# 解决 PyTorch 2.6+ 安全检查问题
-try:
-    torch.serialization.add_safe_globals([np._core.multiarray._reconstruct])
-except AttributeError:
-    torch.serialization.add_safe_globals([np.core.multiarray._reconstruct])
+import sys
 
 # ==========================================
-# 1. 模型加载函数 (4-bit 优化)
+# 工具函数：对齐微调时的 90% Center Crop
 # ==========================================
-def load_vla(img_path, model_id):
-    os.environ["HF_ENDPOINT"] = img_path
-    filepath = try_to_load_from_cache(model_id, "config.json")
+def get_openvla_input(raw_image):
+    """
+    1. 修正翻转
+    2. 取中心 90% 区域 (这是微调时的规范)
+    """
+    # 修正 LIBERO 渲染颠倒
+    corrected = np.flip(raw_image, axis=0)
+    img = Image.fromarray(corrected.astype(np.uint8))
     
-    try:
-        processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
-        vla = AutoModelForVision2Seq.from_pretrained(
-            model_id, 
-            torch_dtype=torch.float16, 
-            low_cpu_mem_usage=True, 
-            trust_remote_code=True,
-            device_map="auto",
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.float16,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_use_double_quant=True
-        )
-        print("--- OpenVLA (4-bit) 加载成功！ ---")
-        return vla, processor
-    except Exception as e:
-        print(f"加载失败: {e}")
-        return None, None
-
-# ==========================================
-# 2. LIBERO 环境配置
-# ==========================================
-def setup_libero_env(task_suite_name, task_id):
-    benchmark_dict = benchmark.get_benchmark_dict()
-    task_suite = benchmark_dict[task_suite_name]()
-    task = task_suite.get_task(task_id)
+    width, height = img.size
+    # 计算 90% 面积对应的边长比例 (约 0.9487)
+    scale = 0.9487 
+    new_w, new_h = int(width * scale), int(height * scale)
     
-    task_bddl_file = os.path.join(get_libero_path("bddl_files"), task.problem_folder, task.bddl_file)
-    print(f"[任务] {task.name} | [指令] {task.language}")
-
-    env_args = {
-        "bddl_file_name": task_bddl_file,
-        "camera_heights": 256,
-        "camera_widths": 256,
-        "camera_names": ["agentview"], 
-        "reward_shaping": True,
-        "control_freq": 20,
-    }
+    left = (width - new_w) / 2
+    top = (height - new_h) / 2
+    right = (width + new_w) / 2
+    bottom = (height + new_h) / 2
     
-    env = OffScreenRenderEnv(**env_args)
-    env.seed(0)
-    obs = env.reset()
-    init_states = task_suite.get_task_init_states(task_id)
-    env.set_init_state(init_states[0])
-    return env, task.language
+    # 裁剪并 Resize 到模型标准的 224
+    input_pil = img.crop((left, top, right, bottom)).resize((224, 224), Image.LANCZOS)
+    return input_pil, corrected
 
 # ==========================================
-# 3. 主程序
+# 主程序
 # ==========================================
 if __name__ == "__main__":
-    MODEL_ID = "openvla/openvla-7b"
-    HF_MIRROR = "https://hf-mirror.com"
-    VIDEO_PATH = "libero_openvla_demo.mp4"
-    MAX_STEPS = 2000 
-    ACTION_SCALE = 4.0  # 建议从 4.0 开始尝试，10.0 有点太大了
-
-    vla, processor = load_vla(HF_MIRROR, MODEL_ID)
-    env, prompt = setup_libero_env("libero_10", 0)
+    MODEL_ID = "openvla/openvla-7b-finetuned-libero-spatial"
+    VIDEO_PATH = "libero_spatial_optimized.mp4"
     
-    # 强制使用 ffmpeg 写入，避免 Tiff 错误
+    # 1. 加载模型 (对齐 4-bit 和特定统计量)
+    processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
+    vla = AutoModelForVision2Seq.from_pretrained(
+        MODEL_ID, 
+        torch_dtype=torch.float16, 
+        device_map="auto",
+        load_in_4bit=True, 
+        trust_remote_code=True
+    )
+
+    # 2. 环境初始化 (LIBERO-Spatial)
+    from libero.libero import benchmark
+    from libero.libero.envs import OffScreenRenderEnv
+    from libero.libero.utils import get_libero_path
+
+    benchmark_dict = benchmark.get_benchmark_dict()
+    task_suite = benchmark_dict["libero_spatial"]()
+    TASK_ID = 1 # 你可以更换 ID
+    task = task_suite.get_task(TASK_ID)
+    task_bddl = os.path.join(get_libero_path("bddl_files"), task.problem_folder, task.bddl_file)
+
+    env = OffScreenRenderEnv(
+        bddl_file_name=task_bddl,
+        camera_heights=256,
+        camera_widths=256,
+        camera_names=["agentview"],
+        control_freq=20,
+    )
+    
+    obs = env.reset()
+    env.set_init_state(task_suite.get_task_init_states(TASK_ID)[0])
+
+    # 3. 推理循环
+    prompt = f"In: What action should the robot take to {task.language}?\nOut:"
     writer = imageio.get_writer(VIDEO_PATH, fps=20, format='FFMPEG', mode='I')
 
-    obs = env.reset()
+    print(f"🚀 正在执行对齐后的任务: {task.language}")
 
-    print("🚀 启动控制循环...")
     try:
-        for step in range(MAX_STEPS):
-            # --- 修正视觉输入 ---
-            # 针对截图中的颠倒问题，我们直接使用 np.flip 进行更彻底的翻转
-            raw_image = obs['agentview_image']
-            # 这种翻转方式确保画面底座在下，物体在上
-            corrected_image = np.flip(raw_image, axis=0) 
+        for step in range(600):
+            # 获取 90% Crop 后的输入
+            input_pil, render_frame = get_openvla_input(obs['agentview_image'])
             
-            input_pil = Image.fromarray(corrected_image.astype(np.uint8))
-
-            # --- VLA 推理 ---
             with torch.inference_mode():
+                prompt="In: What action should the robot take to {open the draw}?\nOut:"
                 inputs = processor(prompt, input_pil).to("cuda", dtype=torch.float16)
-                action = vla.predict_action(**inputs, unnorm_key="bridge_orig")
+                # 【关键】使用笔记中确定的 libero_spatial 统计量
+                action = vla.predict_action(**inputs, unnorm_key="libero_spatial")
 
-            # --- 动作缩放与执行 ---
-            # 10倍可能太猛，这里用 ACTION_SCALE 控制
-            scaled_action = action.astype(np.float64) * ACTION_SCALE
-            # 夹爪动作 (最后一维) 通常不需要缩放，保持在原范围
-            scaled_action[-1] = action[-1] 
+            # 动作执行
+            scaled_action = action.astype(np.float64)
+            # 夹爪逻辑对齐
+            scaled_action[-1] = 1.0 if action[-1] > 0.5 else -1.0
             
             obs, reward, done, info = env.step(scaled_action)
+            writer.append_data(render_frame)
 
-            # --- 保存视频帧 ---
-            writer.append_data(corrected_image)
+            if step % 20 == 0: print(f"Step {step}...")
+            if done: break
 
-            if step % 10 == 0:
-                print(f"Step {step}/{MAX_STEPS} | 动作执行中...")
-            
-            if step % 5 == 0:
-                torch.cuda.empty_cache()
-
-            if done:
-                print("🏁 任务完成！")
-                break
-
-    except Exception as e:
-        print(f"运行时错误: {e}")
     finally:
         writer.close()
         env.close()
-        print(f"✨ 视频已保存至: {os.path.abspath(VIDEO_PATH)}")
+        print(f"✨ 录制完成: {VIDEO_PATH}")
